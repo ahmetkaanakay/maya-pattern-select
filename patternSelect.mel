@@ -1,0 +1,721 @@
+// ============================================================================
+//
+//        +------+      +------+      +------+      +------+
+//        |######|      |######|      |######|      |######|
+//        +------+------+------+------+------+------+------+
+//               |######|      |######|      |######|
+//               +------+      +------+      +------+
+//
+//                  P A T T E R N   S E L E C T   for  Maya
+//
+// ----------------------------------------------------------------------------
+//  Name        : Pattern Select
+//  File        : patternSelect.mel
+//  Version     : 1.0.0
+//  Author      : Ahmet Akay & Claude AI 
+//  License     : MIT (see the license text at the bottom of this file)
+//  Language    : MEL (Autodesk Maya)
+// ----------------------------------------------------------------------------
+//  WHAT IT DOES
+//    Selects faces, edges or vertices of your current selection by a repeating
+//    pattern, e.g. "select 1, skip 2" along a strip, ring or loop.
+//    The order along the strip is detected from the mesh topology, so it keeps
+//    working around bends and corners and on strips that are several faces wide.
+//
+//  INSTALL
+//    A) Quick run : open Script Editor > MEL tab, paste the file, run it.
+//    B) Permanent : copy patternSelect.mel into your Maya scripts folder
+//                   (e.g. Documents/maya/scripts), then run:
+//                       source "patternSelect.mel"; patternSelect;
+//       Tip: select that command text and middle-mouse drag it onto a shelf.
+//
+//  USAGE
+//    1) Select a strip / ring / loop of faces, edges or vertices.
+//    2) Set "Select (count)" and "Skip (count)"  (Select 1, Skip 2 = every 3rd).
+//    3) Press "Select".
+//    Use "Start offset" to shift the pattern, "Invert" to swap select / skip,
+//    and "Use custom pattern" for irregular patterns (1 = select, 0 = skip).
+//
+//  NOTES
+//    - Works on one polygon mesh at a time.
+//    - Face strips are best detected when they are at least ~6 rows long.
+// ============================================================================
+
+
+// ============================================================================
+//  USER INTERFACE
+// ============================================================================
+
+global proc patternSelect()
+{
+    selectPref -trackSelectionOrder true;
+
+    if (`window -exists patternSelectWin`)
+        deleteUI patternSelectWin;
+
+    window -title "Pattern Select  v1.0.0" -widthHeight 340 470 patternSelectWin;
+    columnLayout -adjustableColumn true -rowSpacing 6 -columnOffset "both" 8;
+
+        // ---- Logo banner ----
+        text -label "  PATTERN SELECT" -align "left" -font "boldLabelFont" -height 30
+             -enableBackground true -backgroundColor 0.10 0.55 0.65;
+        text -label "  select by pattern  |  faces  -  edges  -  vertices" -align "left"
+             -height 18 -enableBackground true -backgroundColor 0.16 0.20 0.22;
+        separator -style "none" -height 4;
+
+        intFieldGrp -label "Select (count)" -value1 1 patSel_selCount;
+        intFieldGrp -label "Skip (count)" -value1 1 patSel_skipCount;
+        intFieldGrp -label "Start offset" -value1 0 patSel_offset;
+
+        separator -style "in" -height 6;
+        checkBox -label "Use custom pattern (1 = select, 0 = skip)" -value 0
+            -changeCommand "textField -e -enable (`checkBox -q -value patSel_useCustom`) patSel_pattern;"
+            patSel_useCustom;
+        textField -text "1 1 0 1 0 0" -enable 0 patSel_pattern;
+        separator -style "in" -height 6;
+
+        optionMenuGrp -label "Order" patSel_sort;
+            menuItem -label "Strip order (auto)";
+            menuItem -label "Selection order";
+            menuItem -label "Component index";
+
+        optionMenuGrp -label "Edge type" patSel_edgeMode;
+            menuItem -label "Auto";
+            menuItem -label "Ring (rungs across a strip)";
+            menuItem -label "Loop (edges end to end)";
+
+        checkBox -label "Restart pattern on each strip" -value 1 patSel_restart;
+        checkBox -label "Invert" -value 0 patSel_invert;
+
+        button -label "Select" -height 32 -command "patternSelectRun;";
+
+        separator -style "none" -height 2;
+        text -label "Pattern Select v1.0.0  |  by Ahmet Akay & Claude AI   |  MIT License" -align "center"
+             -font "smallObliqueLabelFont";
+
+    showWindow patternSelectWin;
+}
+
+// ============================================================================
+//  HELPERS
+// ============================================================================
+
+// Returns the numeric index of a component name, e.g. pCube1.f[12] -> 12
+global proc int ps_idx(string $c)
+{
+    string $t[];
+    tokenize $c "[]" $t;
+    int $i = $t[1];
+    return $i;
+}
+
+// Returns components of the same type that touch component $c
+global proc string[] ps_candidates(string $c, string $type, int $viaFace)
+{
+    string $mid[];
+    string $out[];
+
+    if ($type == "f")
+    {
+        $mid = `polyListComponentConversion -toEdge $c`;
+        $out = `polyListComponentConversion -toFace $mid`;
+    }
+    else if ($type == "vtx")
+    {
+        $mid = `polyListComponentConversion -toEdge $c`;
+        $out = `polyListComponentConversion -toVertex $mid`;
+    }
+    else
+    {
+        if ($viaFace)
+            $mid = `polyListComponentConversion -toFace $c`;
+        else
+            $mid = `polyListComponentConversion -toVertex $c`;
+        $out = `polyListComponentConversion -toEdge $mid`;
+    }
+
+    string $flat[] = `ls -flatten $out`;
+    return $flat;
+}
+
+// ============================================================================
+//  FACE STRIP ANALYSIS
+// ============================================================================
+
+// Builds face links for strips that may be several faces wide.
+// Returns 2*count strings: [0..count-1]     = "across" neighbours (same row, side by side)
+//                          [count..2*count-1] = "along" neighbours (next row of the strip)
+// Direction is found from edge classes (chains of opposite edges in quads):
+// the classes running along a long strip are much bigger than the ones across it.
+global proc string[] ps_faceLinks(string $sel[])
+{
+    int $count = size($sel);
+    int $fe[];
+    int $quad[];
+    int $i;
+    int $j;
+    int $k;
+    int $v;
+    int $nRaw;
+    int $ne;
+    int $e;
+    int $a;
+    int $b;
+    int $maxE = 0;
+    string $info[];
+    string $t[];
+
+    // 1) edges of every face
+    for ($i = 0; $i < $count; $i++)
+    {
+        for ($k = 0; $k < 4; $k++)
+            $fe[4 * $i + $k] = -1;
+        $quad[$i] = 0;
+
+        $info = `polyInfo -faceToEdge $sel[$i]`;
+        if (size($info) == 0) continue;
+        tokenize $info[0] " :\n\t\r" $t;
+        $nRaw = size($t) - 2;
+        $quad[$i] = ($nRaw == 4);
+        $ne = $nRaw;
+        if ($ne > 4) $ne = 4;
+        for ($k = 0; $k < $ne; $k++)
+        {
+            $v = $t[$k + 2];
+            $fe[4 * $i + $k] = $v;
+            if ($v > $maxE) $maxE = $v;
+        }
+    }
+
+    int $eF1[];
+    int $eF2[];
+    int $eCls[];
+    string $eAdj[];
+    $eF1[$maxE] = 0;
+    $eF2[$maxE] = 0;
+    $eCls[$maxE] = 0;
+    $eAdj[$maxE] = "";
+
+    // 2) edge -> faces, and "opposite edge" relation inside quads
+    for ($i = 0; $i < $count; $i++)
+    {
+        for ($k = 0; $k < 4; $k++)
+        {
+            $e = $fe[4 * $i + $k];
+            if ($e < 0) continue;
+            if ($eF1[$e] == 0) $eF1[$e] = $i + 1;
+            else if ($eF2[$e] == 0) $eF2[$e] = $i + 1;
+        }
+        if ($quad[$i])
+        {
+            for ($k = 0; $k < 2; $k++)
+            {
+                $a = $fe[4 * $i + $k];
+                $b = $fe[4 * $i + $k + 2];
+                $eAdj[$a] = $eAdj[$a] + $b + " ";
+                $eAdj[$b] = $eAdj[$b] + $a + " ";
+            }
+        }
+    }
+
+    // 3) edge classes (connected chains of opposite edges) and their sizes
+    int $clsSize[];
+    int $nCls = 0;
+    int $queue[];
+    int $head;
+    int $cur;
+    int $q;
+    string $nb[];
+
+    for ($i = 0; $i < $count; $i++)
+    {
+        for ($k = 0; $k < 4; $k++)
+        {
+            $e = $fe[4 * $i + $k];
+            if ($e < 0) continue;
+            if ($eCls[$e] != 0) continue;
+
+            $nCls++;
+            clear $queue;
+            $queue[0] = $e;
+            $eCls[$e] = $nCls;
+            $head = 0;
+            while ($head < size($queue))
+            {
+                $cur = $queue[$head];
+                $head++;
+                tokenize $eAdj[$cur] " " $nb;
+                for ($j = 0; $j < size($nb); $j++)
+                {
+                    $q = $nb[$j];
+                    if ($eCls[$q] == 0)
+                    {
+                        $eCls[$q] = $nCls;
+                        $queue[size($queue)] = $q;
+                    }
+                }
+            }
+            $clsSize[$nCls] = size($queue);
+        }
+    }
+
+    // 4) pairs of selected faces that share an edge
+    int $pa[];
+    int $pb[];
+    int $ps[];
+    int $np = 0;
+    string $fAll[];
+    for ($i = 0; $i < $count; $i++)
+        $fAll[$i] = " ";
+
+    for ($i = 0; $i < $count; $i++)
+    {
+        for ($k = 0; $k < 4; $k++)
+        {
+            $e = $fe[4 * $i + $k];
+            if ($e < 0) continue;
+            if ($eF1[$e] == $i + 1 && $eF2[$e] > 0)
+            {
+                $pa[$np] = $i;
+                $pb[$np] = $eF2[$e] - 1;
+                $ps[$np] = $clsSize[$eCls[$e]];
+                $fAll[$i] = $fAll[$i] + $pb[$np] + " ";
+                $fAll[$pb[$np]] = $fAll[$pb[$np]] + $i + " ";
+                $np++;
+            }
+        }
+    }
+
+    // 5) connected strips (so each strip is judged on its own length)
+    int $comp[];
+    int $nComp = 0;
+    int $compMax[];
+    for ($i = 0; $i < $count; $i++)
+        $comp[$i] = -1;
+
+    for ($i = 0; $i < $count; $i++)
+    {
+        if ($comp[$i] >= 0) continue;
+        clear $queue;
+        $queue[0] = $i;
+        $comp[$i] = $nComp;
+        $compMax[$nComp] = 0;
+        $head = 0;
+        while ($head < size($queue))
+        {
+            $cur = $queue[$head];
+            $head++;
+            tokenize $fAll[$cur] " " $nb;
+            for ($j = 0; $j < size($nb); $j++)
+            {
+                $q = $nb[$j];
+                if ($comp[$q] < 0)
+                {
+                    $comp[$q] = $nComp;
+                    $queue[size($queue)] = $q;
+                }
+            }
+        }
+        $nComp++;
+    }
+
+    int $p;
+    for ($p = 0; $p < $np; $p++)
+    {
+        int $c = $comp[$pa[$p]];
+        if ($ps[$p] > $compMax[$c]) $compMax[$c] = $ps[$p];
+    }
+
+    // 6) split pairs into across (small class) and along (big class)
+    string $adjA[];
+    string $adjB[];
+    for ($i = 0; $i < $count; $i++)
+    {
+        $adjA[$i] = "";
+        $adjB[$i] = "";
+    }
+    for ($p = 0; $p < $np; $p++)
+    {
+        $a = $pa[$p];
+        $b = $pb[$p];
+        if ($ps[$p] * 2 <= $compMax[$comp[$a]])
+        {
+            $adjA[$a] = $adjA[$a] + $b + " ";
+            $adjA[$b] = $adjA[$b] + $a + " ";
+        }
+        else
+        {
+            $adjB[$a] = $adjB[$a] + $b + " ";
+            $adjB[$b] = $adjB[$b] + $a + " ";
+        }
+    }
+
+    string $res[];
+    for ($i = 0; $i < $count; $i++)
+    {
+        $res[$i] = $adjA[$i];
+        $res[$count + $i] = $adjB[$i];
+    }
+    return $res;
+}
+
+// ============================================================================
+//  MAIN: PATTERN SELECT
+// ============================================================================
+
+global proc patternSelectRun()
+{
+    string $patStr = `textField -q -text patSel_pattern`;
+    int $selCount  = `intFieldGrp -q -value1 patSel_selCount`;
+    int $skipCount = `intFieldGrp -q -value1 patSel_skipCount`;
+    int $useCustom = `checkBox -q -value patSel_useCustom`;
+    int $offset    = `intFieldGrp -q -value1 patSel_offset`;
+    int $mode      = `optionMenuGrp -q -select patSel_sort`;
+    int $edgeMode  = `optionMenuGrp -q -select patSel_edgeMode`;
+    int $restart   = `checkBox -q -value patSel_restart`;
+    int $invert    = `checkBox -q -value patSel_invert`;
+
+    // ---- Parse pattern ----
+    int $pat[];
+    int $n = 0;
+    int $i;
+    int $j;
+
+    if ($useCustom)
+    {
+        string $tok[];
+        tokenize $patStr " ,;" $tok;
+        $n = size($tok);
+        if ($n == 0)
+        {
+            warning "Custom pattern is empty. Example: 1 1 0 1 0 0";
+            return;
+        }
+        for ($i = 0; $i < $n; $i++)
+            $pat[$i] = ($tok[$i] != "0");
+    }
+    else
+    {
+        if ($selCount < 1)
+        {
+            warning "Select (count) must be at least 1.";
+            return;
+        }
+        if ($skipCount < 0) $skipCount = 0;
+        $n = $selCount + $skipCount;
+        for ($i = 0; $i < $n; $i++)
+            $pat[$i] = ($i < $selCount);
+    }
+
+    // ---- Get selection ----
+    string $raw[];
+    if ($mode == 2)
+        $raw = `ls -orderedSelection -flatten`;
+    else
+        $raw = `ls -selection -flatten`;
+
+    if (size($raw) == 0)
+    {
+        warning "Select some faces, edges or vertices first.";
+        return;
+    }
+
+    // ---- Detect component type ----
+    string $type = "";
+    if (size(`match "\\.f\\[" $raw[0]`) > 0)        $type = "f";
+    else if (size(`match "\\.e\\[" $raw[0]`) > 0)   $type = "e";
+    else if (size(`match "\\.vtx\\[" $raw[0]`) > 0) $type = "vtx";
+    else
+    {
+        warning "Selection must be polygon faces, edges or vertices.";
+        return;
+    }
+
+    string $sel[];
+    string $needle = "\\." + $type + "\\[";
+    for ($i = 0; $i < size($raw); $i++)
+        if (size(`match $needle $raw[$i]`) > 0)
+            $sel[size($sel)] = $raw[$i];
+
+    int $count = size($sel);
+
+    // ---- Groups: a group is one "step" of the pattern ----
+    int $gN = 0;
+    string $members[];     // per group: " 3 7 " (positions in $sel)
+    int $gOrder[];         // groups in strip order
+    int $startFlag[];      // 1 where a new strip starts
+
+    if ($mode == 1)
+    {
+        // ---------- Topology based ----------
+        int $map[];        // component index -> position + 1
+        for ($i = 0; $i < $count; $i++)
+            $map[ps_idx($sel[$i])] = $i + 1;
+        int $mapSize = size($map);
+
+        // adjA: direct neighbours (edge: via vertex). adjB: edges via face (ring)
+        string $adjA[];
+        string $adjB[];
+        string $cand[];
+        int $nPass = 1;
+        if ($type == "e") $nPass = 2;
+        if ($type == "f") $nPass = 0;
+        string $fl[];
+        if ($type == "f") $fl = ps_faceLinks($sel);
+        int $pass;
+        int $self;
+        int $ci;
+
+        for ($i = 0; $i < $count; $i++)
+        {
+            $adjA[$i] = " ";
+            $adjB[$i] = " ";
+            if ($type == "f")
+            {
+                $adjA[$i] = " " + $fl[$i];
+                $adjB[$i] = " " + $fl[$count + $i];
+            }
+            $self = ps_idx($sel[$i]);
+            for ($pass = 0; $pass < $nPass; $pass++)
+            {
+                $cand = ps_candidates($sel[$i], $type, $pass);
+                for ($j = 0; $j < size($cand); $j++)
+                {
+                    $ci = ps_idx($cand[$j]);
+                    if ($ci != $self && $ci < $mapSize && $map[$ci] > 0)
+                    {
+                        if ($pass == 0)
+                            $adjA[$i] = $adjA[$i] + ($map[$ci] - 1) + " ";
+                        else
+                            $adjB[$i] = $adjB[$i] + ($map[$ci] - 1) + " ";
+                    }
+                }
+            }
+        }
+
+        // Flood fill on adjA: connected pieces (collinear rung pieces for rings)
+        int $ff[];
+        int $ffSize[];
+        int $ffN = 0;
+        int $maxFF = 0;
+        int $queue[];
+        int $head;
+        int $cur;
+        int $q;
+        string $nbs[];
+
+        for ($i = 0; $i < $count; $i++)
+            $ff[$i] = -1;
+
+        for ($i = 0; $i < $count; $i++)
+        {
+            if ($ff[$i] >= 0) continue;
+            clear $queue;
+            $queue[0] = $i;
+            $ff[$i] = $ffN;
+            $head = 0;
+            while ($head < size($queue))
+            {
+                $cur = $queue[$head];
+                $head++;
+                tokenize $adjA[$cur] " " $nbs;
+                for ($j = 0; $j < size($nbs); $j++)
+                {
+                    $q = $nbs[$j];
+                    if ($ff[$q] < 0)
+                    {
+                        $ff[$q] = $ffN;
+                        $queue[size($queue)] = $q;
+                    }
+                }
+            }
+            $ffSize[$ffN] = size($queue);
+            if ($ffSize[$ffN] > $maxFF) $maxFF = $ffSize[$ffN];
+            $ffN++;
+        }
+
+        // Ring or loop?
+        int $useRing = 0;
+        if ($type == "f") $useRing = 1;
+        if ($type == "e")
+        {
+            if ($edgeMode == 2) $useRing = 1;
+            else if ($edgeMode == 1 && $maxFF <= 4) $useRing = 1;
+        }
+
+        int $grp[];
+        string $links[];
+        if ($useRing)
+        {
+            $gN = $ffN;
+            for ($i = 0; $i < $count; $i++)
+            {
+                $grp[$i] = $ff[$i];
+                $links[$i] = $adjB[$i];
+            }
+        }
+        else
+        {
+            $gN = $count;
+            for ($i = 0; $i < $count; $i++)
+            {
+                $grp[$i] = $i;
+                $links[$i] = $adjA[$i];
+            }
+        }
+
+        string $gAdj[];
+        int $gDeg[];
+        int $gVis[];
+        int $g;
+        for ($g = 0; $g < $gN; $g++)
+        {
+            $members[$g] = " ";
+            $gAdj[$g] = " ";
+            $gDeg[$g] = 0;
+            $gVis[$g] = 0;
+        }
+        for ($i = 0; $i < $count; $i++)
+            $members[$grp[$i]] = $members[$grp[$i]] + $i + " ";
+
+        // Group level links
+        int $g1;
+        int $g2;
+        string $key;
+        for ($i = 0; $i < $count; $i++)
+        {
+            tokenize $links[$i] " " $nbs;
+            for ($j = 0; $j < size($nbs); $j++)
+            {
+                $q = $nbs[$j];
+                $g1 = $grp[$i];
+                $g2 = $grp[$q];
+                if ($g1 != $g2)
+                {
+                    $key = " " + $g2 + " ";
+                    if (size(`match $key $gAdj[$g1]`) == 0)
+                    {
+                        $gAdj[$g1] = $gAdj[$g1] + $g2 + " ";
+                        $gDeg[$g1] = $gDeg[$g1] + 1;
+                    }
+                }
+            }
+        }
+
+        // Walk strips: first from open ends, then closed loops
+        int $walkPass;
+        int $first;
+        int $next;
+        int $pos;
+        for ($walkPass = 0; $walkPass < 2; $walkPass++)
+        {
+            for ($g = 0; $g < $gN; $g++)
+            {
+                if ($gVis[$g]) continue;
+                if ($walkPass == 0 && $gDeg[$g] > 1) continue;
+
+                $cur = $g;
+                $first = 1;
+                while ($cur >= 0)
+                {
+                    $gVis[$cur] = 1;
+                    $pos = size($gOrder);
+                    $gOrder[$pos] = $cur;
+                    $startFlag[$pos] = $first;
+                    $first = 0;
+
+                    tokenize $gAdj[$cur] " " $nbs;
+                    $next = -1;
+                    for ($j = 0; $j < size($nbs); $j++)
+                    {
+                        $q = $nbs[$j];
+                        if (!$gVis[$q])
+                        {
+                            $next = $q;
+                            break;
+                        }
+                    }
+                    $cur = $next;
+                }
+            }
+        }
+    }
+    else
+    {
+        // ---------- Selection order / index order: one single strip ----------
+        $gN = $count;
+        for ($i = 0; $i < $count; $i++)
+        {
+            $members[$i] = " " + $i + " ";
+            $gOrder[$i] = $i;
+            $startFlag[$i] = ($i == 0);
+        }
+    }
+
+    // ---- Apply pattern ----
+    int $off = (($offset % $n) + $n) % $n;
+    int $counter = 0;
+    string $result[];
+    string $mem[];
+
+    for ($i = 0; $i < size($gOrder); $i++)
+    {
+        if ($restart && $startFlag[$i])
+            $counter = 0;
+
+        int $k = ($counter + $off) % $n;
+        int $pick = $pat[$k];
+        if ($invert) $pick = !$pick;
+
+        if ($pick)
+        {
+            tokenize $members[$gOrder[$i]] " " $mem;
+            for ($j = 0; $j < size($mem); $j++)
+            {
+                int $m = $mem[$j];
+                $result[size($result)] = $sel[$m];
+            }
+        }
+        $counter++;
+    }
+
+    // ---- Select result ----
+    if (size($result) > 0)
+        select -replace $result;
+    else
+        select -clear;
+
+    print ("Pattern Select: " + size($result) + " of " + $count + " components selected.\n");
+}
+
+// ============================================================================
+//  START
+// ============================================================================
+
+// Open the window
+patternSelect;
+
+
+// ============================================================================
+//  LICENSE  (MIT)
+//
+//  Copyright (c) 2026 Ahmet Akay & Claude AI
+//
+//  Permission is hereby granted, free of charge, to any person obtaining a copy
+//  of this software and associated documentation files (the "Software"), to deal
+//  in the Software without restriction, including without limitation the rights
+//  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//  copies of the Software, and to permit persons to whom the Software is
+//  furnished to do so, subject to the following conditions:
+//
+//  The above copyright notice and this permission notice shall be included in
+//  all copies or substantial portions of the Software.
+//
+//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//  SOFTWARE.
+// ============================================================================
